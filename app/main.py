@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from app.core.database import init_db
 from app.api.topics import router as topics_router
+from app.api.messages import router as messages_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -18,6 +19,7 @@ app = FastAPI(
 )
 
 app.include_router(topics_router, prefix="/api/v1", tags=["Topics"])
+app.include_router(messages_router, prefix="/api/v1", tags=["Messages"])
 
 @app.get("/health")
 async def health_check():
