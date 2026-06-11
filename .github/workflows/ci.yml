@@ -47,7 +47,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run health check test
+      - name: Run tests
         env:
           DATABASE_URL: postgresql://pulseuser:pulse123@localhost:5432/pulsequeue
           REDIS_URL: redis://localhost:6379
@@ -55,6 +55,7 @@ jobs:
           uvicorn app.main:app --host 0.0.0.0 --port 8001 &
           sleep 10
           curl -f http://localhost:8001/health
+           python3 -m pytest tests/test_api.py::test_health_check -v
 
   docker:
     runs-on: ubuntu-latest
