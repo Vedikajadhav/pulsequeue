@@ -118,3 +118,49 @@ async def consume_messages(topic_name: str, request: ConsumeRequest):
             ],
             "count": len(rows)
         }
+
+class AckMessage(BaseModel):
+    message_id: str
+    success: bool
+    error_reason: str | None = None
+
+@router.post("/messages/ack")
+async def acknowledge_message(ack: AckMessage):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        message = await conn.fetchrow(
+            "SELECT id, retry_count, topic_id FROM messages WHERE id = $1",
+            ack.message_id
+        )
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        if ack.success:
+            # Success — consumed
+            await conn.execute(
+                "UPDATE messages SET status = 'consumed' WHERE id = $1",
+                message["id"]
+            )
+            return {"status": "consumed", "message_id": ack.message_id}
+        else:
+            retry_count = message["retry_count"] + 1
+            if retry_count >= 3:
+                # Dead-letter queue
+                await conn.execute(
+                    "UPDATE messages SET status = 'failed' WHERE id = $1",
+                    message["id"]
+                )
+                await conn.execute(
+                    """INSERT INTO dead_letters (message_id, error_reason)
+                       VALUES ($1, $2)""",
+                    message["id"], ack.error_reason or "Max retries exceeded"
+                )
+                return {"status": "dead_lettered", "message_id": ack.message_id}
+            else:
+                # Retry
+                await conn.execute(
+                    """UPDATE messages SET status = 'pending', retry_count = $1
+                       WHERE id = $2""",
+                    retry_count, message["id"]
+                )
+                return {"status": "retrying", "retry_count": retry_count, "message_id": ack.message_id}
