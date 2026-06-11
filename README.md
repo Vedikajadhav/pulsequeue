@@ -1,19 +1,25 @@
 # PulseQueue 🚀
 
 A production-grade distributed message queue system built with FastAPI, PostgreSQL, and Redis — supporting topic-based pub/sub, consumer groups, idempotent publishing, exponential backoff retries, and dead letter queues.
-
 ## Architecture
-Producer ──▶ FastAPI API Layer ──▶ PostgreSQL (primary store)
-│                      │
-│              ┌───────┴────────┐
-│              │                │
-└──▶ Redis     │   topics       │
-Cache     │   messages     │
-│         │   consumer_grps│
-├─ topic  │   offsets      │
-├─ group  │   dead_letters │
-└─ offset └────────────────┘
 
+```
+┌──────────┐     ┌─────────────────┐     ┌──────────────────┐
+│ Producer │────▶│   FastAPI API   │────▶│   PostgreSQL     │
+└──────────┘     └────────┬────────┘     │                  │
+                          │              │  topics          │
+┌──────────┐              │              │  messages        │
+│ Consumer │────▶         │              │  consumer_groups │
+└──────────┘              │              │  offsets         │
+                          ▼              │  dead_letters    │
+                  ┌───────────────┐      └──────────────────┘
+                  │     Redis     │
+                  │               │
+                  │  topic cache  │
+                  │  group cache  │
+                  │ offset cache  │
+                  └───────────────┘
+```
 
 
 ## Features
