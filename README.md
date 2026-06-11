@@ -82,16 +82,19 @@ POST /api/v1/messages/ack
 
 ## Retry Flow
 
-
+```
 Message fails ──▶ retry_count + 1
-│
-┌─────────┴──────────┐
-│                    │
-count < 3             count >= 3
-│                    │
-retry_after = NOW()      status = failed
-+ 2^n seconds            dead_letters table
-
+                        │
+              ┌─────────┴──────────┐
+              │                    │
+        count < 3             count >= 3
+              │                    │
+    retry_after = NOW()      status = failed
+    + 2^n seconds         ──▶ dead_letters table
+              │
+    consume madhe skip
+    until retry_after <= NOW()
+```
 
 ## Database Schema
 
