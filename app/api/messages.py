@@ -15,14 +15,12 @@ class PublishMessage(BaseModel):
 async def publish_message(topic_name: str, message: PublishMessage):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Topic exists ka?
         topic = await conn.fetchrow(
             "SELECT id, partition_count FROM topics WHERE name = $1", topic_name
         )
         if not topic:
             raise HTTPException(status_code=404, detail=f"Topic '{topic_name}' not found")
 
-        # Idempotency check
         if message.idempotency_key:
             existing = await conn.fetchrow(
                 "SELECT id FROM messages WHERE idempotency_key = $1",
@@ -31,10 +29,8 @@ async def publish_message(topic_name: str, message: PublishMessage):
             if existing:
                 return {"status": "duplicate", "message_id": str(existing["id"])}
 
-        # Partition select karo
         partition = hash(message.idempotency_key or str(uuid.uuid4())) % topic["partition_count"]
 
-        # Message insert karo
         row = await conn.fetchrow(
             """INSERT INTO messages (topic_id, partition_num, payload, idempotency_key, status)
                VALUES ($1, $2, $3, $4, 'pending')
@@ -60,7 +56,7 @@ async def consume_messages(topic_name: str, request: ConsumeRequest):
     pool = await get_pool()
     redis = await get_redis()
 
-    # --- Redis cache: topic id ---
+    # Redis cache: topic id
     topic_cache_key = f"topic:{topic_name}"
     topic_id = await redis.get(topic_cache_key)
 
@@ -74,7 +70,7 @@ async def consume_messages(topic_name: str, request: ConsumeRequest):
         topic_id = str(topic["id"])
         await redis.set(topic_cache_key, topic_id, ex=60)
 
-    # --- Redis cache: consumer group id ---
+    # Redis cache: consumer group id
     group_cache_key = f"group:{topic_id}:{request.group_name}"
     group_id = await redis.get(group_cache_key)
 
@@ -93,12 +89,14 @@ async def consume_messages(topic_name: str, request: ConsumeRequest):
         group_id = str(group["id"])
         await redis.set(group_cache_key, group_id, ex=60)
 
-    # --- SKIP LOCKED: safe concurrent dequeue ---
+    # SKIP LOCKED + exponential backoff filter
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT id, payload, partition_num, retry_count
                FROM messages
-               WHERE topic_id = $1 AND status = 'pending'
+               WHERE topic_id = $1
+                 AND status = 'pending'
+                 AND (retry_after IS NULL OR retry_after <= NOW())
                ORDER BY created_at
                LIMIT $2
                FOR UPDATE SKIP LOCKED""",
@@ -115,7 +113,6 @@ async def consume_messages(topic_name: str, request: ConsumeRequest):
             message_ids
         )
 
-        # Offset update (DB + Redis cache)
         await conn.execute(
             """INSERT INTO offsets (group_id, partition_num, last_message_id, updated_at)
                VALUES ($1, 0, $2, NOW())
@@ -124,7 +121,6 @@ async def consume_messages(topic_name: str, request: ConsumeRequest):
             uuid.UUID(group_id), message_ids[-1]
         )
 
-        # Hot offset Redis mein cache karo
         offset_key = f"offset:{group_id}:0"
         await redis.set(offset_key, str(message_ids[-1]), ex=300)
 
@@ -158,7 +154,6 @@ async def acknowledge_message(ack: AckMessage):
             raise HTTPException(status_code=404, detail="Message not found")
 
         if ack.success:
-            # Success - consumed
             await conn.execute(
                 "UPDATE messages SET status = 'consumed' WHERE id = $1",
                 message["id"]
@@ -179,10 +174,19 @@ async def acknowledge_message(ack: AckMessage):
                 )
                 return {"status": "dead_lettered", "message_id": ack.message_id}
             else:
-                # Retry
+                # Exponential backoff: 2^retry_count seconds
+                backoff_seconds = 2 ** retry_count
                 await conn.execute(
-                    """UPDATE messages SET status = 'pending', retry_count = $1
-                       WHERE id = $2""",
-                    retry_count, message["id"]
+                    """UPDATE messages
+                       SET status = 'pending',
+                           retry_count = $1,
+                           retry_after = NOW() + ($2 || ' seconds')::interval
+                       WHERE id = $3""",
+                    retry_count, str(backoff_seconds), message["id"]
                 )
-                return {"status": "retrying", "retry_count": retry_count, "message_id": ack.message_id}
+                return {
+                    "status": "retrying",
+                    "retry_count": retry_count,
+                    "retry_after_seconds": backoff_seconds,
+                    "message_id": ack.message_id
+                }
