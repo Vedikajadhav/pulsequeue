@@ -1,14 +1,15 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
-from app.core.database import init_db
+from app.core.database import init_db, close_db
 from app.api.topics import router as topics_router
 from app.api.messages import router as messages_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    print("Database connected!")
+    print("Database + Redis connected!")
     yield
+    await close_db()
     print("Shutting down...")
 
 app = FastAPI(

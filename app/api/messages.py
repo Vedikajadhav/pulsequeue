@@ -2,7 +2,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any
 import uuid
-from app.core.database import get_pool
+import json
+from app.core.database import get_pool, get_redis
 
 router = APIRouter()
 
@@ -24,7 +25,7 @@ async def publish_message(topic_name: str, message: PublishMessage):
         # Idempotency check
         if message.idempotency_key:
             existing = await conn.fetchrow(
-                "SELECT id FROM messages WHERE idempotency_key = $1", 
+                "SELECT id FROM messages WHERE idempotency_key = $1",
                 message.idempotency_key
             )
             if existing:
@@ -38,7 +39,7 @@ async def publish_message(topic_name: str, message: PublishMessage):
             """INSERT INTO messages (topic_id, partition_num, payload, idempotency_key, status)
                VALUES ($1, $2, $3, $4, 'pending')
                RETURNING id, status, created_at""",
-            topic["id"], partition, 
+            topic["id"], partition,
             str(message.payload).replace("'", '"'),
             message.idempotency_key
         )
@@ -57,55 +58,75 @@ class ConsumeRequest(BaseModel):
 @router.post("/topics/{topic_name}/consume")
 async def consume_messages(topic_name: str, request: ConsumeRequest):
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        # Topic check
-        topic = await conn.fetchrow(
-            "SELECT id FROM topics WHERE name = $1", topic_name
-        )
+    redis = await get_redis()
+
+    # --- Redis cache: topic id ---
+    topic_cache_key = f"topic:{topic_name}"
+    topic_id = await redis.get(topic_cache_key)
+
+    if topic_id is None:
+        async with pool.acquire() as conn:
+            topic = await conn.fetchrow(
+                "SELECT id FROM topics WHERE name = $1", topic_name
+            )
         if not topic:
             raise HTTPException(status_code=404, detail=f"Topic '{topic_name}' not found")
+        topic_id = str(topic["id"])
+        await redis.set(topic_cache_key, topic_id, ex=60)
 
-        # Consumer group find or create
-        group = await conn.fetchrow(
-            "SELECT id FROM consumer_groups WHERE topic_id = $1 AND group_name = $2",
-            topic["id"], request.group_name
-        )
-        if not group:
+    # --- Redis cache: consumer group id ---
+    group_cache_key = f"group:{topic_id}:{request.group_name}"
+    group_id = await redis.get(group_cache_key)
+
+    if group_id is None:
+        async with pool.acquire() as conn:
             group = await conn.fetchrow(
-                """INSERT INTO consumer_groups (topic_id, group_name)
-                   VALUES ($1, $2) RETURNING id""",
-                topic["id"], request.group_name
+                "SELECT id FROM consumer_groups WHERE topic_id = $1 AND group_name = $2",
+                uuid.UUID(topic_id), request.group_name
             )
+            if not group:
+                group = await conn.fetchrow(
+                    """INSERT INTO consumer_groups (topic_id, group_name)
+                       VALUES ($1, $2) RETURNING id""",
+                    uuid.UUID(topic_id), request.group_name
+                )
+        group_id = str(group["id"])
+        await redis.set(group_cache_key, group_id, ex=60)
 
-        # SKIP LOCKED — safe concurrent dequeue
+    # --- SKIP LOCKED: safe concurrent dequeue ---
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT id, payload, partition_num, retry_count
                FROM messages
                WHERE topic_id = $1 AND status = 'pending'
-               ORDER BY created_at ASC
+               ORDER BY created_at
                LIMIT $2
                FOR UPDATE SKIP LOCKED""",
-            topic["id"], request.max_messages
+            uuid.UUID(topic_id), request.max_messages
         )
 
         if not rows:
             return {"messages": [], "count": 0}
 
-        # Status update to processing
-        message_ids = [row["id"] for row in rows]
+        message_ids = [r["id"] for r in rows]
+
         await conn.execute(
             "UPDATE messages SET status = 'processing' WHERE id = ANY($1::uuid[])",
             message_ids
         )
 
-        # Offset update
+        # Offset update (DB + Redis cache)
         await conn.execute(
             """INSERT INTO offsets (group_id, partition_num, last_message_id, updated_at)
                VALUES ($1, 0, $2, NOW())
-               ON CONFLICT (group_id, partition_num) 
+               ON CONFLICT (group_id, partition_num)
                DO UPDATE SET last_message_id = $2, updated_at = NOW()""",
-            group["id"], message_ids[-1]
+            uuid.UUID(group_id), message_ids[-1]
         )
+
+        # Hot offset Redis mein cache karo
+        offset_key = f"offset:{group_id}:0"
+        await redis.set(offset_key, str(message_ids[-1]), ex=300)
 
         return {
             "messages": [
@@ -114,7 +135,8 @@ async def consume_messages(topic_name: str, request: ConsumeRequest):
                     "payload": r["payload"],
                     "partition": r["partition_num"],
                     "retry_count": r["retry_count"]
-                } for r in rows
+                }
+                for r in rows
             ],
             "count": len(rows)
         }
@@ -129,14 +151,14 @@ async def acknowledge_message(ack: AckMessage):
     pool = await get_pool()
     async with pool.acquire() as conn:
         message = await conn.fetchrow(
-            "SELECT id, retry_count, topic_id FROM messages WHERE id = $1",
-            ack.message_id
+            "SELECT id, retry_count FROM messages WHERE id = $1",
+            uuid.UUID(ack.message_id)
         )
         if not message:
             raise HTTPException(status_code=404, detail="Message not found")
 
         if ack.success:
-            # Success — consumed
+            # Success - consumed
             await conn.execute(
                 "UPDATE messages SET status = 'consumed' WHERE id = $1",
                 message["id"]
